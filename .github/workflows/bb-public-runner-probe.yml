@@ -1,0 +1,10 @@
+name: BB Public Runner Probe
+on:
+  pull_request:
+    branches: [main]
+    paths: ['bb_probe/**']
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo PUBLIC_RUNNER_OK
