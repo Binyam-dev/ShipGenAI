@@ -1,0 +1,149 @@
+name: Behind Billions Video 001
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+    paths:
+      - 'behind_billions_v001/trigger/**'
+
+permissions:
+  contents: read
+
+jobs:
+  render-publish:
+    if: startsWith(github.head_ref, 'behind-billions-v001-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      SUPABASE_URL: https://zmymcdiuaffcthwmmyxi.supabase.co
+      SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpteW1jZGl1YWZmY3Rod21teXhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ3MzE4NzYsImV4cCI6MjEwMDMwNzg3Nn0.JJk3KtUVRcQi4hL-tOwxWSA0mrIJWpLFE0532SrQREM
+      VIDEO_URL: https://zmymcdiuaffcthwmmyxi.supabase.co/storage/v1/object/public/behind-billions-media/v001/BehindBillions_001_ThereAreWorldsWithNoSun.mp4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg espeak-ng fonts-dejavu-core
+          python -m pip install --upgrade pip
+          python -m pip install 'kokoro>=0.9.4' soundfile pillow requests numpy
+
+      - name: Render final vertical master and QC
+        run: |
+          python behind_billions_v001/build.py
+          cat behind_billions_v001/dist/qc.json
+
+      - name: Upload permanent public media
+        run: |
+          set -euo pipefail
+          FILE='behind_billions_v001/dist/BehindBillions_001_ThereAreWorldsWithNoSun_web.mp4'
+          test -s "$FILE"
+          CODE=$(curl -sS -o /tmp/upload.json -w '%{http_code}' \
+            -X POST "$SUPABASE_URL/storage/v1/object/behind-billions-media/v001/BehindBillions_001_ThereAreWorldsWithNoSun.mp4" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H 'Content-Type: video/mp4' \
+            --data-binary "@$FILE")
+          cat /tmp/upload.json
+          test "$CODE" -ge 200 && test "$CODE" -lt 300
+          curl -fIL --retry 5 --retry-delay 3 "$VIDEO_URL"
+
+      - name: Insert publication queue item
+        id: queue
+        run: |
+          set -euo pipefail
+          QUEUE_ID=$(python -c 'import uuid; print(uuid.uuid4())')
+          echo "queue_id=$QUEUE_ID" >> "$GITHUB_OUTPUT"
+          python - "$QUEUE_ID" <<'PY'
+          import json,sys
+          qid=sys.argv[1]
+          payload={
+            'id':qid,
+            'topic':'rogue planets',
+            'title':'There Are Worlds With No Sun',
+            'caption':'There are planets with no sun — worlds drifting alone through the Milky Way. Astronomers detect these dark wanderers through gravitational microlensing, and NASA says recent research suggests there may be trillions of them. #BehindBillions #Space #Astronomy #Science #RoguePlanets #Universe',
+            'video_url':'https://zmymcdiuaffcthwmmyxi.supabase.co/storage/v1/object/public/behind-billions-media/v001/BehindBillions_001_ThereAreWorldsWithNoSun.mp4',
+            'status':'ready',
+            'metadata':{
+              'episode':1,
+              'voice':'Kokoro am_onyx',
+              'voice_policy':'original model voice; no real-person imitation',
+              'format':'1080x1920 H.264/AAC 30fps',
+              'sources':['NASA Science rogue planets','NASA Goddard Roman microlensing']
+            }
+          }
+          open('/tmp/queue.json','w').write(json.dumps(payload))
+          PY
+          CODE=$(curl -sS -o /tmp/queue_resp.json -w '%{http_code}' \
+            -X POST "$SUPABASE_URL/rest/v1/behind_billions_publish_queue" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H 'Content-Type: application/json' \
+            -H 'Prefer: return=minimal' \
+            --data-binary @/tmp/queue.json)
+          cat /tmp/queue_resp.json || true
+          test "$CODE" -ge 200 && test "$CODE" -lt 300
+
+      - name: Share now through Buffer to YouTube and TikTok
+        run: |
+          set -euo pipefail
+          QUEUE_ID='${{ steps.queue.outputs.queue_id }}'
+          python - "$QUEUE_ID" <<'PY'
+          import json,sys
+          open('/tmp/publish.json','w').write(json.dumps({'queue_id':sys.argv[1]}))
+          PY
+          CODE=$(curl -sS -o /tmp/publish_resp.json -w '%{http_code}' \
+            -X POST "$SUPABASE_URL/functions/v1/behind-billions-publish" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/publish.json)
+          cat /tmp/publish_resp.json
+          test "$CODE" -ge 200 && test "$CODE" -lt 300
+          python - <<'PY'
+          import json
+          d=json.load(open('/tmp/publish_resp.json'))
+          if d.get('error') or d.get('failures'): raise SystemExit(str(d))
+          PY
+
+      - name: Wait until both platform posts are sent
+        run: |
+          set -euo pipefail
+          QUEUE_ID='${{ steps.queue.outputs.queue_id }}'
+          for i in $(seq 1 45); do
+            python - "$QUEUE_ID" <<'PY'
+          import json,sys
+          open('/tmp/check.json','w').write(json.dumps({'queue_id':sys.argv[1],'check_only':True}))
+          PY
+            curl -sS -f \
+              -X POST "$SUPABASE_URL/functions/v1/behind-billions-publish" \
+              -H "apikey: $SUPABASE_ANON_KEY" \
+              -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+              -H 'Content-Type: application/json' \
+              --data-binary @/tmp/check.json > /tmp/check_resp.json
+            cat /tmp/check_resp.json
+            STATUS=$(python -c "import json; print(json.load(open('/tmp/check_resp.json')).get('status','unknown'))")
+            if [ "$STATUS" = published ]; then exit 0; fi
+            if [ "$STATUS" = failed ]; then exit 1; fi
+            sleep 20
+          done
+          exit 1
+
+      - name: Save production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: behind-billions-v001-production
+          path: |
+            behind_billions_v001/dist/qc.json
+            behind_billions_v001/dist/credits.txt
+            /tmp/upload.json
+            /tmp/publish_resp.json
+            /tmp/check_resp.json
+          if-no-files-found: ignore
+          retention-days: 30
